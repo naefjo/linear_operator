@@ -20,6 +20,8 @@ try:
     from jaxtyping import Float, Int
 except ImportError:
     pass
+from time import perf_counter
+
 from torch import Tensor
 
 import linear_operator
@@ -61,6 +63,72 @@ from linear_operator.utils.warnings import NumericalWarning, PerformanceWarning
 _HANDLED_FUNCTIONS = {}
 _HANDLED_SECOND_ARG_FUNCTIONS = {}
 _TYPES_DICT = {torch.float: "float", torch.half: "half", torch.double: "double"}
+
+
+def cholesky_downdate_maiworm(old_cholesky_factor, removal_idx):
+    """Remove ONE row/col from cholesky factor"""
+    if old_cholesky_factor.ndim == 2:
+        n, _ = old_cholesky_factor.size()
+        b = 1
+    else:
+        b, n, _ = old_cholesky_factor.size()
+    new_cholesky_factor = torch.zeros(b, n - 1, n - 1)
+    # L_11
+    new_cholesky_factor[..., :removal_idx, :removal_idx] = old_cholesky_factor[..., :removal_idx, :removal_idx]
+    # L_31
+    new_cholesky_factor[..., removal_idx:, :removal_idx] = old_cholesky_factor[..., removal_idx + 1 :, :removal_idx]
+    L_32 = old_cholesky_factor[..., removal_idx + 1 :, removal_idx].unsqueeze(-1)
+    L_33 = old_cholesky_factor[..., removal_idx + 1 :, removal_idx + 1 :]
+
+    # L_33
+    new_cholesky_factor[..., removal_idx:, removal_idx:], _ = torch.linalg.cholesky_ex(L_32 @ L_32.T + L_33 @ L_33.T)
+
+    return new_cholesky_factor.squeeze()
+
+
+def cholesky_downdate_givens(old_cholesky_factor, selector):
+    """Apply a selection matrix (n-k, n) to a cholesky factor and then perform
+    a set of Givens rotations until the product is lower triangular
+    """
+    cholesky_factor_ = selector @ old_cholesky_factor
+    max_dim = max(cholesky_factor_.size(-1), cholesky_factor_.size(-2))
+    min_dim = min(cholesky_factor_.size(-1), cholesky_factor_.size(-2))
+    diff_dim = max_dim - min_dim
+
+    # time_before_givens = perf_counter()
+    for off_diag in range(diff_dim, 0, -1):
+        off_diagonal_elements = torch.diag(cholesky_factor_, diagonal=off_diag)
+        off_diagonal_nonzero = off_diagonal_elements != 0
+        nonzero_indices = torch.nonzero(off_diagonal_nonzero).squeeze()
+
+        if nonzero_indices.ndim == 0:
+            nonzero_indices = nonzero_indices.unsqueeze(0)
+
+        for i in nonzero_indices:
+            if abs(cholesky_factor_[i, i + off_diag]) < 1e-6:
+                continue
+
+            a_ij_idx = cholesky_factor_[i, i + off_diag]
+            a_jj_idx = cholesky_factor_[i, i]
+            if abs(a_ij_idx) < 1e-8:
+                c_idx, s_idx = 1, 0
+            elif abs(a_ij_idx) > abs(a_jj_idx):
+                sqrt_factor = torch.sqrt(1 + (a_jj_idx / a_ij_idx) ** 2)
+                c_idx = -a_jj_idx / (a_ij_idx * sqrt_factor)
+                s_idx = 1 / (sqrt_factor)
+            else:
+                sqrt_factor = torch.sqrt(1 + (a_ij_idx / a_jj_idx) ** 2)
+                c_idx = 1 / (sqrt_factor)
+                s_idx = -a_ij_idx / (a_jj_idx * sqrt_factor)
+
+            rot_arr = torch.Tensor([[c_idx, s_idx], [-s_idx, c_idx]])
+            cholesky_factor_[i:, [i, i + off_diag]] = cholesky_factor_[i:, [i, i + off_diag]] @ rot_arr
+
+    if cholesky_factor_.size(-2) != cholesky_factor_.size(-1):
+        min_dim = min(cholesky_factor_.size(-2), cholesky_factor_.size(-1))
+        cholesky_factor_ = cholesky_factor_[..., :min_dim, :min_dim]
+
+    return cholesky_factor_
 
 
 def _implements(torch_function: Callable) -> Callable:
@@ -1147,6 +1215,53 @@ class LinearOperator(object):
     def batch_shape(self) -> torch.Size:
         return self.shape[:-2]
 
+    def remove_root_rows(self, data_selector: torch.Tensor, n_target: int):
+        from linear_operator.operators.block_interleaved_linear_operator import BlockInterleavedLinearOperator
+        from linear_operator.operators.chol_linear_operator import CholLinearOperator
+        from linear_operator.operators.matmul_linear_operator import MatmulLinearOperator
+        from linear_operator.operators.triangular_linear_operator import TriangularLinearOperator
+
+        data_selector_interleaved = data_selector.repeat_interleave(n_target)
+        data_selector_interleaved_tsr = torch.diag(data_selector_interleaved)[
+            torch.nonzero(data_selector_interleaved).squeeze(), :
+        ]
+        # data_selector_tsr = torch.diag(data_selector)[torch.nonzero(data_selector).squeeze(), :]
+        # TODO(@naefjo): apply selector to self?
+        time_before_root = perf_counter()
+        old_decomp = self.root_decomposition().root
+        print(f"\troot time: {1e3*(perf_counter() - time_before_root)}")
+        time_before_su = perf_counter()
+        self = MatmulLinearOperator(
+            data_selector_interleaved_tsr, MatmulLinearOperator(self, data_selector_interleaved_tsr.T)
+        )
+        print(f"\tself update time: {1e3*(perf_counter() - time_before_su)}")
+
+        if not isinstance(old_decomp, TriangularLinearOperator):
+            raise RuntimeError("cholesky factor is not triangular operator :(")
+
+        cholesky_factors = []
+        old_decomp_dense = old_decomp.to_dense()
+        chol_n = old_decomp_dense.shape[-1]
+
+        time_before_dd = perf_counter()
+        for i in range(n_target):
+            chol_factor_batch = old_decomp_dense[torch.arange(i, chol_n, n_target), :]
+            chol_factor_batch = chol_factor_batch[:, torch.arange(i, chol_n, n_target)]
+            chol_out = cholesky_downdate_maiworm(
+                chol_factor_batch, torch.argwhere(~(data_selector.to(torch.bool))).item()
+            )
+            # chol_out_g = cholesky_downdate(chol_factor_batch, data_selector_tsr)
+            cholesky_factors.append(chol_out)
+
+        print(f"\tdd time: {1e3*(perf_counter() - time_before_dd)}")
+        new_chol_factor = TriangularLinearOperator(
+            BlockInterleavedLinearOperator(torch.stack(cholesky_factors, -3)).to_dense()
+        )
+
+        add_to_cache(self, "cholesky", CholLinearOperator(new_chol_factor))
+        add_to_cache(self, "root_decomposition", CholLinearOperator(new_chol_factor))
+        return self
+
     def cat_rows(
         self: Float[LinearOperator, "... M N"],
         cross_mat: Float[torch.Tensor, "... O N"],
@@ -1227,6 +1342,7 @@ class LinearOperator(object):
         """
         from linear_operator.operators import to_linear_operator
         from linear_operator.operators.cat_linear_operator import CatLinearOperator
+        from linear_operator.operators.chol_linear_operator import CholLinearOperator
         from linear_operator.operators.root_linear_operator import RootLinearOperator
         from linear_operator.operators.triangular_linear_operator import TriangularLinearOperator
 
@@ -1235,7 +1351,7 @@ class LinearOperator(object):
                 "root_inv_decomposition is only generated when " "root_decomposition is generated.",
                 UserWarning,
             )
-        B_, B = cross_mat, to_linear_operator(cross_mat)
+        B_, B = cross_mat.to_dense(), to_linear_operator(cross_mat)
         D = to_linear_operator(new_mat)
         batch_shape = B.shape[:-2]
         if self.ndimension() < cross_mat.ndimension():
@@ -1264,8 +1380,13 @@ class LinearOperator(object):
         # Get components for new root Z = [E 0; F G]
         E = self.root_decomposition(**root_decomp_kwargs).root  # E = L, LL^T = A
         m, n = E.shape[-2:]
-        R = self.root_inv_decomposition().root.to_dense()  # RR^T = A^{-1} (this is fast if L is triangular)
-        lower_left = B_ @ R  # F = BR
+
+        if not isinstance(E, TriangularLinearOperator):
+            warnings.warn(
+                f"L is not TriangularLinearOperator but {type(E)}. Solve will be inefficient:(", PerformanceWarning
+            )
+
+        lower_left = E.solve(B_.mT).mT
         schur = D - lower_left.matmul(lower_left.mT)  # GG^T = new_mat - FF^T
         schur_root = to_linear_operator(schur).root_decomposition().root  # G = (new_mat - FF^T)^{1/2}
 
@@ -1275,6 +1396,10 @@ class LinearOperator(object):
         new_root[..., :m, :n] = E.to_dense()
         new_root[..., m:, : lower_left.shape[-1]] = lower_left
         new_root[..., m:, n : (n + schur_root.shape[-1])] = schur_root.to_dense()
+        if isinstance(E, TriangularLinearOperator) and isinstance(schur_root, TriangularLinearOperator):
+            if not getattr(E, "upper", False) and not getattr(schur_root, "upper", False):
+                new_root = TriangularLinearOperator(new_root)
+
         if generate_inv_roots:
             if isinstance(E, TriangularLinearOperator) and isinstance(schur_root, TriangularLinearOperator):
                 # make sure these are actually lower triangular
@@ -1292,7 +1417,7 @@ class LinearOperator(object):
                 RootLinearOperator(to_linear_operator(new_inv_root)),
             )
 
-        add_to_cache(new_linear_op, "root_decomposition", RootLinearOperator(to_linear_operator(new_root)))
+        add_to_cache(new_linear_op, "root_decomposition", CholLinearOperator(to_linear_operator(new_root)))
 
         return new_linear_op
 
@@ -2139,6 +2264,7 @@ class LinearOperator(object):
         from linear_operator.operators import to_linear_operator
         from linear_operator.operators.chol_linear_operator import CholLinearOperator
         from linear_operator.operators.root_linear_operator import RootLinearOperator
+        from linear_operator.operators.triangular_linear_operator import TriangularLinearOperator
 
         if not self.is_square:
             raise RuntimeError(
@@ -2147,7 +2273,7 @@ class LinearOperator(object):
             )
 
         if self.shape[-2:].numel() == 1:
-            return RootLinearOperator(self.to_dense().sqrt())
+            return RootLinearOperator(TriangularLinearOperator(self.to_dense().sqrt()))
 
         if method is None:
             method = self._choose_root_method()
