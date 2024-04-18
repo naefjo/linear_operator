@@ -10,6 +10,7 @@ import warnings
 from abc import abstractmethod
 from collections import OrderedDict
 from copy import deepcopy
+
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -20,7 +21,7 @@ try:
     from jaxtyping import Float, Int
 except ImportError:
     pass
-from time import perf_counter
+# from time import perf_counter
 
 from torch import Tensor
 
@@ -1216,50 +1217,56 @@ class LinearOperator(object):
         return self.shape[:-2]
 
     def remove_root_rows(self, data_selector: torch.Tensor, n_target: int):
-        from linear_operator.operators.block_interleaved_linear_operator import BlockInterleavedLinearOperator
+        # from linear_operator.operators.block_interleaved_linear_operator import BlockInterleavedLinearOperator
         from linear_operator.operators.chol_linear_operator import CholLinearOperator
         from linear_operator.operators.matmul_linear_operator import MatmulLinearOperator
         from linear_operator.operators.triangular_linear_operator import TriangularLinearOperator
 
+        # time_before_interleave = perf_counter()
         data_selector_interleaved = data_selector.repeat_interleave(n_target)
         data_selector_interleaved_tsr = torch.diag(data_selector_interleaved)[
             torch.nonzero(data_selector_interleaved).squeeze(), :
         ]
+        # print(f"\tinterleave time: {1e3*(perf_counter() - time_before_interleave)}")
         # data_selector_tsr = torch.diag(data_selector)[torch.nonzero(data_selector).squeeze(), :]
         # TODO(@naefjo): apply selector to self?
-        time_before_root = perf_counter()
+        # time_before_root = perf_counter()
         old_decomp = self.root_decomposition().root
-        print(f"\troot time: {1e3*(perf_counter() - time_before_root)}")
-        time_before_su = perf_counter()
+        # print(f"\troot time: {1e3*(perf_counter() - time_before_root)}")
+        # time_before_su = perf_counter()
         self = MatmulLinearOperator(
             data_selector_interleaved_tsr, MatmulLinearOperator(self, data_selector_interleaved_tsr.T)
         )
-        print(f"\tself update time: {1e3*(perf_counter() - time_before_su)}")
+        # print(f"\tself update time: {1e3*(perf_counter() - time_before_su)}")
 
         if not isinstance(old_decomp, TriangularLinearOperator):
             raise RuntimeError("cholesky factor is not triangular operator :(")
 
-        cholesky_factors = []
         old_decomp_dense = old_decomp.to_dense()
+        new_chol_dense = torch.zeros(old_decomp_dense.shape[-2] - n_target, old_decomp_dense.shape[-1] - n_target)
         chol_n = old_decomp_dense.shape[-1]
+        chol_n_new = new_chol_dense.shape[-1]
 
-        time_before_dd = perf_counter()
+        # time_before_dd = perf_counter()
         for i in range(n_target):
-            chol_factor_batch = old_decomp_dense[torch.arange(i, chol_n, n_target), :]
-            chol_factor_batch = chol_factor_batch[:, torch.arange(i, chol_n, n_target)]
+            indices = torch.arange(i, chol_n, n_target)
+            indices_new = torch.arange(i, chol_n_new, n_target)
+            chol_factor_batch = old_decomp_dense[indices, :][:, indices]
             chol_out = cholesky_downdate_maiworm(
                 chol_factor_batch, torch.argwhere(~(data_selector.to(torch.bool))).item()
             )
-            # chol_out_g = cholesky_downdate(chol_factor_batch, data_selector_tsr)
-            cholesky_factors.append(chol_out)
+            tmp = new_chol_dense[indices_new, :]
+            tmp[:, indices_new] = chol_out
+            new_chol_dense[indices_new, :] = tmp
 
-        print(f"\tdd time: {1e3*(perf_counter() - time_before_dd)}")
-        new_chol_factor = TriangularLinearOperator(
-            BlockInterleavedLinearOperator(torch.stack(cholesky_factors, -3)).to_dense()
-        )
+        # print(f"\tdd time: {1e3*(perf_counter() - time_before_dd)}")
+        # time_before_finalizing = perf_counter()
+        new_chol_factor = TriangularLinearOperator(new_chol_dense)
 
         add_to_cache(self, "cholesky", CholLinearOperator(new_chol_factor))
         add_to_cache(self, "root_decomposition", CholLinearOperator(new_chol_factor))
+        # print(f"\tfinalizing time: {1e3*(perf_counter() - time_before_finalizing)}")
+
         return self
 
     def cat_rows(
